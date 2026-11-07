@@ -44,8 +44,6 @@ public class CatalogController {
     @GetMapping("/sync-status") public Map<String,Object> syncStatus(){return repository.syncState();}
     @PostMapping("/sync") public Map<String,Object> syncNow(){boolean started=syncService.requestSyncIfStale();return Map.of("status",started?"accepted":"skipped","message",started?"Catalog sync started in the background.":"A recent sync is already running or fresh.");}
     @PostMapping("/ratings/refresh") public Map<String,Object> refreshRatings(){
-        Map<String,Object> usage=syncService.omdbDailyUsage();
-        if(Boolean.TRUE.equals(usage.get("limitReached")))return Map.of("status","rate_limited","message","All configured OMDb keys reached their daily limits. Try again tomorrow.");
         boolean started=syncService.requestRatingRefresh();
         return Map.of("status",started?"accepted":"busy","message",started?"IMDb rating refresh started in the background.":"A catalog or rating refresh is already running.");
     }

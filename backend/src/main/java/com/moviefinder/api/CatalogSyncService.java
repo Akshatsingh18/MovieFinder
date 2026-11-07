@@ -65,6 +65,8 @@ public class CatalogSyncService {
 
     @Scheduled(initialDelay=10000,fixedDelayString="${app.sync-interval-ms:86400000}")
     public void scheduledSync(){requestSync();}
+    @Scheduled(cron="${app.imdb-dataset-cron:0 30 4 * * *}",zone="Asia/Kolkata")
+    public void scheduledImdbDatasetRefresh(){requestImdbDatasetRefresh();}
 
     public boolean requestSyncIfStale(){
         if(running.get()||ratingRefreshing.get())return false;
@@ -95,6 +97,18 @@ public class CatalogSyncService {
             if(running.get()||ratingRefreshing.get())return false;
             ratingRefreshing.set(true);
             try{syncExecutor.execute(this::refreshRatings);return true;}
+            catch(RuntimeException e){ratingRefreshing.set(false);throw e;}
+        }
+    }
+    public boolean requestImdbDatasetRefresh(){
+        if(!imdbDatasetEnabled)return false;
+        synchronized(jobLock){
+            if(running.get()||ratingRefreshing.get())return false;
+            ratingRefreshing.set(true);
+            try{syncExecutor.execute(()->{
+                try{Instant start=Instant.now();repository.setRatingRefreshState("running",java.sql.Timestamp.from(start),null,0,0,"Refreshing ratings from IMDb's daily dataset");applyImdbDatasetFallback(start,0,0,"IMDb dataset refresh complete.");}
+                finally{ratingRefreshing.set(false);}
+            });return true;}
             catch(RuntimeException e){ratingRefreshing.set(false);throw e;}
         }
     }
