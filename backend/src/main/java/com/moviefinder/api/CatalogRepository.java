@@ -82,6 +82,21 @@ public class CatalogRepository {
             }, region);
     }
 
+    public List<Map<String,Object>> imdbRatedTitles(String region) {
+        return jdbc.query("SELECT id, imdb_id AS \"imdbId\", imdb_rating AS \"imdbRating\" FROM catalog_title WHERE region=? AND imdb_id IS NOT NULL AND imdb_id<>''",
+            (rs,row)->{
+                Map<String,Object> item=new HashMap<>();item.put("id",rs.getString("id"));item.put("imdbId",rs.getString("imdbId"));
+                double rating=rs.getDouble("imdbRating");item.put("imdbRating",rs.wasNull()?null:rating);return item;
+            },region);
+    }
+
+    public void saveImdbDatasetRatings(List<Object[]> ratings, Instant checkedAt) {
+        if(ratings.isEmpty())return;
+        List<Object[]> rows=new ArrayList<>(ratings.size());
+        for(Object[] rating:ratings)rows.add(new Object[]{rating[1],rating[2],java.sql.Timestamp.from(checkedAt),rating[0]});
+        jdbc.batchUpdate("UPDATE catalog_title SET imdb_rating=?, imdb_votes=?, imdb_rating_checked_at=? WHERE id=?",rows);
+    }
+
     public void saveImdbLookup(String id, String imdbId, Double rating, Instant checkedAt) {
         jdbc.update("""
             UPDATE catalog_title SET

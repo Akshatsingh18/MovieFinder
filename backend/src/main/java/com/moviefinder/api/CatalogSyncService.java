@@ -20,6 +20,12 @@ import org.springframework.web.client.RestClientResponseException;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import java.util.concurrent.Executor;
 import java.net.http.HttpClient;
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.net.URLConnection;
+import java.util.zip.GZIPInputStream;
 
 @Service
 public class CatalogSyncService {
@@ -33,6 +39,8 @@ public class CatalogSyncService {
     private final boolean v3;
     private final int syncPages;
     private final long syncOpenCooldownMs;
+    private final boolean imdbDatasetEnabled;
+    private final String imdbDatasetUrl;
     private final AtomicBoolean running=new AtomicBoolean(false),ratingRefreshing=new AtomicBoolean(false);
     private final Object jobLock=new Object();
     private volatile String omdbKeyError="";
@@ -43,10 +51,13 @@ public class CatalogSyncService {
       @Value("${TMDB_API_KEY:}") String tmdbKey,@Value("${OMDB_API_KEYS:}") String omdbKeys,
       @Value("${OMDB_API_KEY:}") String legacyOmdbKey,
       @Value("${app.region:IN}") String region,@Value("${app.sync-pages:5}") int syncPages,
-      @Value("${app.sync-open-cooldown-ms:21600000}") long syncOpenCooldownMs){
+      @Value("${app.sync-open-cooldown-ms:21600000}") long syncOpenCooldownMs,
+      @Value("${app.imdb-dataset-enabled:true}") boolean imdbDatasetEnabled,
+      @Value("${app.imdb-dataset-url:https://datasets.imdbws.com/title.ratings.tsv.gz}") String imdbDatasetUrl){
         if(tmdbKey.isBlank())throw new IllegalStateException("Set TMDB_API_KEY before starting the backend.");
         this.repository=repository;this.syncExecutor=syncExecutor;this.tmdbKey=tmdbKey;this.omdbKeys=parseOmdbKeys(omdbKeys,legacyOmdbKey);this.omdbKeyFingerprints=this.omdbKeys.stream().map(CatalogSyncService::fingerprint).toList();this.region=region;this.syncPages=Math.max(1,Math.min(syncPages,50));
         this.syncOpenCooldownMs=syncOpenCooldownMs;
+        this.imdbDatasetEnabled=imdbDatasetEnabled;this.imdbDatasetUrl=imdbDatasetUrl;
         this.v3=tmdbKey.matches("(?i)[0-9a-f]{32}");
         RestClient.Builder b=RestClient.builder().baseUrl(TMDB).requestFactory(httpRequestFactory());if(!v3)b.defaultHeader("Authorization","Bearer "+tmdbKey);this.tmdb=b.build();
         this.omdb=RestClient.builder().requestFactory(httpRequestFactory()).build();
@@ -290,11 +301,36 @@ public class CatalogSyncService {
                 else message="Rating refresh complete. Checked "+checked+" titles and updated "+updated+" ratings.";
             }
             repository.setRatingRefreshState(status,java.sql.Timestamp.from(start),java.sql.Timestamp.from(Instant.now()),checked,updated,message);
+            if(imdbDatasetEnabled)applyImdbDatasetFallback(start,checked,updated,message);
         }catch(Exception e){
             message="Rating refresh failed: "+e.getClass().getSimpleName();
             try{repository.setRatingRefreshState("failed",java.sql.Timestamp.from(start),java.sql.Timestamp.from(Instant.now()),checked,updated,message);}catch(Exception ignored){}
         }
         finally{ratingRefreshing.set(false);}
+    }
+    private void applyImdbDatasetFallback(Instant refreshStarted,int omdbChecked,int omdbUpdated,String omdbMessage){
+        try{
+            List<Map<String,Object>> titles=repository.imdbRatedTitles(region);
+            Map<String,Map<String,Object>> byImdbId=new HashMap<>();for(Map<String,Object> title:titles)byImdbId.put(String.valueOf(title.get("imdbId")),title);
+            repository.setRatingRefreshState("running",java.sql.Timestamp.from(refreshStarted),null,omdbChecked,omdbUpdated,
+                "Checking IMDb's daily ratings dataset for "+byImdbId.size()+" catalog titles");
+            List<Object[]> updates=new ArrayList<>();int matched=0,changed=0;
+            URLConnection connection=URI.create(imdbDatasetUrl).toURL().openConnection();connection.setConnectTimeout(15000);connection.setReadTimeout(30000);
+            try(InputStream input=new GZIPInputStream(connection.getInputStream());BufferedReader reader=new BufferedReader(new InputStreamReader(input,StandardCharsets.UTF_8))){
+                reader.readLine();String line;
+                while((line=reader.readLine())!=null){
+                    String[] row=line.split("\\t",-1);if(row.length<3)continue;Map<String,Object> title=byImdbId.get(row[0]);if(title==null)continue;
+                    try{double rating=Double.parseDouble(row[1]);long votes=Long.parseLong(row[2]);matched++;Double previous=(Double)title.get("imdbRating");if(!Objects.equals(previous,rating))changed++;updates.add(new Object[]{title.get("id"),rating,votes});}
+                    catch(NumberFormatException ignored){}
+                }
+            }
+            repository.saveImdbDatasetRatings(updates,Instant.now());
+            repository.setRatingRefreshState("complete",java.sql.Timestamp.from(refreshStarted),java.sql.Timestamp.from(Instant.now()),omdbChecked,omdbUpdated+changed,
+                omdbMessage+" IMDb dataset matched "+matched+" titles and updated "+changed+" ratings.");
+        }catch(Exception e){
+            repository.setRatingRefreshState("complete",java.sql.Timestamp.from(refreshStarted),java.sql.Timestamp.from(Instant.now()),omdbChecked,omdbUpdated,
+                omdbMessage+" IMDb dataset fallback was unavailable; OMDb ratings were preserved.");
+        }
     }
     private boolean sameTitle(String a,String b){return normalize(a).equals(normalize(b));}
     private String normalize(String value){return Normalizer.normalize(value,Normalizer.Form.NFD).replaceAll("\\p{M}","").toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]","");}
