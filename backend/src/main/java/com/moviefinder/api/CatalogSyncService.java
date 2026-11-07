@@ -17,7 +17,9 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientResponseException;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import java.util.concurrent.Executor;
+import java.net.http.HttpClient;
 
 @Service
 public class CatalogSyncService {
@@ -25,7 +27,7 @@ public class CatalogSyncService {
     private static final List<String> SERVICES=List.of("Netflix","Amazon Prime Video","JioHotstar");
     private final CatalogRepository repository;
     private final Executor syncExecutor;
-    private final RestClient tmdb,omdb=RestClient.create();
+    private final RestClient tmdb,omdb;
     private final String tmdbKey,region;
     private final List<String> omdbKeys,omdbKeyFingerprints;
     private final boolean v3;
@@ -46,7 +48,8 @@ public class CatalogSyncService {
         this.repository=repository;this.syncExecutor=syncExecutor;this.tmdbKey=tmdbKey;this.omdbKeys=parseOmdbKeys(omdbKeys,legacyOmdbKey);this.omdbKeyFingerprints=this.omdbKeys.stream().map(CatalogSyncService::fingerprint).toList();this.region=region;this.syncPages=Math.max(1,Math.min(syncPages,50));
         this.syncOpenCooldownMs=syncOpenCooldownMs;
         this.v3=tmdbKey.matches("(?i)[0-9a-f]{32}");
-        RestClient.Builder b=RestClient.builder().baseUrl(TMDB);if(!v3)b.defaultHeader("Authorization","Bearer "+tmdbKey);this.tmdb=b.build();
+        RestClient.Builder b=RestClient.builder().baseUrl(TMDB).requestFactory(httpRequestFactory());if(!v3)b.defaultHeader("Authorization","Bearer "+tmdbKey);this.tmdb=b.build();
+        this.omdb=RestClient.builder().requestFactory(httpRequestFactory()).build();
     }
 
     @Scheduled(initialDelay=10000,fixedDelayString="${app.sync-interval-ms:86400000}")
@@ -305,6 +308,10 @@ public class CatalogSyncService {
     private static String fingerprint(String key){
         try{return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(key.getBytes(StandardCharsets.UTF_8)));}
         catch(NoSuchAlgorithmException e){throw new IllegalStateException("SHA-256 is not available",e);}
+    }
+    private static JdkClientHttpRequestFactory httpRequestFactory(){
+        JdkClientHttpRequestFactory factory=new JdkClientHttpRequestFactory(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(8)).build());
+        factory.setReadTimeout(Duration.ofSeconds(15));return factory;
     }
     private String path(String p){return v3?p+(p.contains("?")?"&":"?")+"api_key={apiKey}":p;}
     private Object[] vars(Object... values){if(!v3)return values;Object[] a=Arrays.copyOf(values,values.length+1);a[values.length]=tmdbKey;return a;}
