@@ -52,7 +52,9 @@ public class CatalogController {
     @GetMapping("/ratings/refresh-status") public Map<String,Object> ratingRefreshStatus(){
         Map<String,Object> result=new java.util.LinkedHashMap<>(repository.ratingRefreshState());
         Map<String,Object> usage=syncService.omdbDailyUsage();
-        if("rate_limited".equals(result.get("status"))&&!Boolean.TRUE.equals(usage.get("limitReached"))){
+        if("running".equals(result.get("status"))&&!syncService.isRatingRefreshing()){
+            result.put("status","idle");result.put("message","No IMDb refresh is currently running. You can start one now.");
+        }else if("rate_limited".equals(result.get("status"))&&!Boolean.TRUE.equals(usage.get("limitReached"))){
             result.put("status","idle");result.put("message","OMDb keys are ready for another refresh.");
         }
         result.put("usage",usage);return result;
