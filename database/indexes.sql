@@ -1,5 +1,8 @@
 -- Apply once to an existing Movie Finder PostgreSQL database.
 -- CREATE INDEX CONCURRENTLY avoids blocking catalog reads and writes while building.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_catalog_title_title_trgm
+  ON catalog_title USING gin (title gin_trgm_ops);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_catalog_title_region_latest
   ON catalog_title (region, release_year DESC NULLS LAST, popularity DESC NULLS LAST, title);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_catalog_title_region_popular

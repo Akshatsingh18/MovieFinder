@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS catalog_title (
   UNIQUE (tmdb_id, media_type, region)
 );
 ALTER TABLE catalog_title ADD COLUMN IF NOT EXISTS imdb_rating_checked_at TIMESTAMPTZ;
+ALTER TABLE catalog_title ADD COLUMN IF NOT EXISTS imdb_votes BIGINT;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS idx_catalog_title_title_trgm ON catalog_title USING gin (title gin_trgm_ops);
 -- Catalog pagination: region plus the two supported sort orders, with media type variants.
 CREATE INDEX IF NOT EXISTS idx_catalog_title_region_latest
   ON catalog_title (region, release_year DESC NULLS LAST, popularity DESC NULLS LAST, title);
@@ -64,3 +67,9 @@ CREATE TABLE IF NOT EXISTS rating_refresh_state (
 INSERT INTO rating_refresh_state (id, status, message)
 VALUES (1, 'idle', 'IMDb ratings have not been refreshed yet')
 ON CONFLICT (id) DO NOTHING;
+CREATE TABLE IF NOT EXISTS omdb_daily_usage (
+  usage_date DATE PRIMARY KEY,
+  request_count INTEGER NOT NULL DEFAULT 0,
+  limit_reached BOOLEAN NOT NULL DEFAULT FALSE,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

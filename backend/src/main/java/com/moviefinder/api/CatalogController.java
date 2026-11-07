@@ -21,7 +21,8 @@ public class CatalogController {
     @GetMapping("/catalog")
     public Map<String,Object> catalog(@RequestParam(defaultValue="all") String platform,
         @RequestParam(defaultValue="all") String type, @RequestParam(defaultValue="all") String genre,
-        @RequestParam(defaultValue="latest") String sort, @RequestParam(defaultValue="0") double minRating,
+        @RequestParam(defaultValue="latest") String sort, @RequestParam(defaultValue="") String q,
+        @RequestParam(defaultValue="0") double minRating,
         @RequestParam(defaultValue="10") double maxRating, @RequestParam(defaultValue="1") int page) {
         if(!List.of("all","Netflix","Amazon Prime Video","JioHotstar").contains(platform)) throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Unknown platform");
         if(!List.of("all","movie","tv").contains(type)) throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Unknown media type");
@@ -32,15 +33,24 @@ public class CatalogController {
         boolean syncing=syncService.isSyncing()||state.equals("pending")||state.equals("running");
         Object message=status.get("message");
         String syncMessage=message==null?(syncing?"Catalog is being imported into PostgreSQL":""):String.valueOf(message);
-        return repository.page(region,platform,type,genre,minRating,maxRating,sort,page,20,syncing,syncMessage);
+        return repository.page(region,platform,type,genre,q.trim(),minRating,maxRating,sort,page,20,syncing,syncMessage);
     }
 
     @GetMapping("/genres") public List<String> genres(){return repository.genres(region);}
+    @GetMapping("/catalog/{id}/watch-link") public Map<String,Object> watchLink(@PathVariable String id){
+        try{return syncService.titleWatchLink(id);}
+        catch(IllegalArgumentException e){throw new ResponseStatusException(HttpStatus.BAD_REQUEST,e.getMessage());}
+    }
     @GetMapping("/sync-status") public Map<String,Object> syncStatus(){return repository.syncState();}
     @PostMapping("/sync") public Map<String,Object> syncNow(){boolean started=syncService.requestSyncIfStale();return Map.of("status",started?"accepted":"skipped","message",started?"Catalog sync started in the background.":"A recent sync is already running or fresh.");}
     @PostMapping("/ratings/refresh") public Map<String,Object> refreshRatings(){
+        Map<String,Object> usage=repository.omdbDailyUsage();
+        if(Boolean.TRUE.equals(usage.get("limitReached")))return Map.of("status","rate_limited","message","OMDb daily request limit reached. Try again tomorrow.");
         boolean started=syncService.requestRatingRefresh();
         return Map.of("status",started?"accepted":"busy","message",started?"IMDb rating refresh started in the background.":"A catalog or rating refresh is already running.");
     }
-    @GetMapping("/ratings/refresh-status") public Map<String,Object> ratingRefreshStatus(){return repository.ratingRefreshState();}
+    @GetMapping("/ratings/refresh-status") public Map<String,Object> ratingRefreshStatus(){
+        Map<String,Object> result=new java.util.LinkedHashMap<>(repository.ratingRefreshState());
+        result.put("usage",repository.omdbDailyUsage());return result;
+    }
 }
