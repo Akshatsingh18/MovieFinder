@@ -52,3 +52,15 @@ CREATE TABLE IF NOT EXISTS catalog_sync_state (
   message TEXT
 );
 INSERT INTO catalog_sync_state (id, status) VALUES (1, 'pending') ON CONFLICT (id) DO NOTHING;
+CREATE TABLE IF NOT EXISTS rating_refresh_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  status VARCHAR(20) NOT NULL DEFAULT 'idle',
+  started_at TIMESTAMPTZ,
+  finished_at TIMESTAMPTZ,
+  rows_checked INTEGER NOT NULL DEFAULT 0,
+  ratings_updated INTEGER NOT NULL DEFAULT 0,
+  message TEXT
+);
+INSERT INTO rating_refresh_state (id, status, message)
+VALUES (1, 'idle', 'IMDb ratings have not been refreshed yet')
+ON CONFLICT (id) DO NOTHING;

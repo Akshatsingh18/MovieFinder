@@ -13,6 +13,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
 import java.util.concurrent.Executor;
 
 @Service
@@ -27,10 +28,12 @@ public class CatalogSyncService {
     private final int syncPages;
     private final long syncOpenCooldownMs;
     private final int ratingRecheckDays;
-    private final AtomicBoolean running=new AtomicBoolean(false);
+    private final AtomicBoolean running=new AtomicBoolean(false),ratingRefreshing=new AtomicBoolean(false);
+    private final Object jobLock=new Object();
+    private volatile Instant omdbRateLimitedUntil=Instant.MIN;
     private volatile String message="Waiting for first background sync";
     private final Map<String,Map<Integer,String>> genres=new ConcurrentHashMap<>();
-    private final Map<String,String> imdbIds=new ConcurrentHashMap<>(), ratings=new ConcurrentHashMap<>();
+    private final Map<String,String> imdbIds=new ConcurrentHashMap<>();
 
     public CatalogSyncService(CatalogRepository repository, @Qualifier("catalogSyncExecutor") Executor syncExecutor,
       @Value("${TMDB_API_KEY:}") String tmdbKey,@Value("${OMDB_API_KEY:}") String omdbKey,
@@ -48,19 +51,36 @@ public class CatalogSyncService {
     public void scheduledSync(){requestSync();}
 
     public boolean requestSyncIfStale(){
-        if(running.get())return false;
+        if(running.get()||ratingRefreshing.get())return false;
         Map<String,Object> state=repository.syncState();
         String status=String.valueOf(state.getOrDefault("status","pending"));
         if(status.equals("running"))return false;
         Object finished=state.get("finishedAt");
         Instant last=finished instanceof java.sql.Timestamp ts?ts.toInstant():finished instanceof java.time.OffsetDateTime odt?odt.toInstant():null;
         if(last!=null&&Duration.between(last,Instant.now()).toMillis()<syncOpenCooldownMs)return false;
-        requestSync();return true;
+        return startCatalogSync();
     }
 
     public void requestSync(){
-        if(!running.compareAndSet(false,true))return;
-        syncExecutor.execute(this::syncCatalog);
+        startCatalogSync();
+    }
+
+    private boolean startCatalogSync(){
+        synchronized(jobLock){
+            if(running.get()||ratingRefreshing.get())return false;
+            running.set(true);
+            try{syncExecutor.execute(this::syncCatalog);return true;}
+            catch(RuntimeException e){running.set(false);throw e;}
+        }
+    }
+
+    public boolean requestRatingRefresh(){
+        synchronized(jobLock){
+            if(running.get()||ratingRefreshing.get())return false;
+            ratingRefreshing.set(true);
+            try{syncExecutor.execute(this::refreshRatings);return true;}
+            catch(RuntimeException e){ratingRefreshing.set(false);throw e;}
+        }
     }
 
     private void syncCatalog(){
@@ -89,6 +109,7 @@ public class CatalogSyncService {
     }
 
     public boolean isSyncing(){return running.get();}
+    public boolean isRatingRefreshing(){return ratingRefreshing.get();}
     public String message(){return message;}
 
     private Map<String,Object> discover(String media,String provider,int page){
@@ -116,11 +137,21 @@ public class CatalogSyncService {
         String title=String.valueOf(hit.getOrDefault("title",hit.get("name")));
         Object existingRating=existing.get("imdb_rating"),checkedObject=existing.get("imdb_rating_checked_at");
         Instant checkedAt=checkedObject instanceof java.sql.Timestamp ts?ts.toInstant():checkedObject instanceof java.time.OffsetDateTime odt?odt.toInstant():null;
-        String rating;Instant updatedCheckedAt=checkedAt;
-        if(existingRating instanceof Number n){rating=String.valueOf(n.doubleValue());}
-        else if(checkedAt!=null&&Duration.between(checkedAt,Instant.now()).toDays()<ratingRecheckDays){rating="N/A";}
-        else if(omdbKey.isBlank()){rating="N/A";}
-        else {RatingResult result=lookupRating(imdbId,title,date,media);imdbId=result.imdbId();rating=result.rating();updatedCheckedAt=Instant.now();}
+        boolean hasSavedRating=existingRating instanceof Number;
+        String rating=hasSavedRating?String.valueOf(((Number)existingRating).doubleValue()):"N/A";
+        Instant updatedCheckedAt=checkedAt;
+        int checkIntervalDays=hasSavedRating?ratingRecheckDays:1;
+        boolean ratingIsFresh=checkedAt!=null&&Duration.between(checkedAt,Instant.now()).toDays()<checkIntervalDays;
+        if(!ratingIsFresh&&!omdbKey.isBlank()){
+            RatingResult result=lookupRating(imdbId,title,date,media);
+            imdbId=result.imdbId();
+            if(result.rateLimited()){
+                omdbRateLimitedUntil=Instant.now().plus(Duration.ofHours(24));
+            }else if(result.checked()){
+                if(result.rating()!=null)rating=String.valueOf(result.rating());
+                updatedCheckedAt=Instant.now();
+            }
+        }
         Map<String,Object> row=new LinkedHashMap<>();row.put("id",itemId);row.put("type",media);row.put("name",title);
         row.put("year",date.length()>=4?date.substring(0,4):"");row.put("genres",tags);row.put("platforms",List.of(platform));row.put("imdbId",imdbId);
         row.put("imdbRating",rating);row.put("imdbRatingCheckedAt",updatedCheckedAt);row.put("popularity",hit.getOrDefault("popularity",0));row.put("poster",hit.get("poster_path")==null?"":"https://image.tmdb.org/t/p/w342"+hit.get("poster_path"));
@@ -128,20 +159,98 @@ public class CatalogSyncService {
     }
     private Map<Integer,String> loadGenres(String media){Map<String,Object> data=tmdb.get().uri(path("/genre/{media}/list?language=en"),vars(media)).retrieve().body(Map.class);Map<Integer,String> r=new HashMap<>();if(data!=null)for(Map<String,Object> g:(List<Map<String,Object>>)data.getOrDefault("genres",List.of()))r.put(((Number)g.get("id")).intValue(),String.valueOf(g.get("name")));return r;}
     private String externalId(String media,String id){try{Map<String,Object> d=tmdb.get().uri(path("/{media}/{id}/external_ids"),vars(media,id)).retrieve().body(Map.class);Object ext=d==null?null:d.get("imdb_id");return ext==null?"":String.valueOf(ext);}catch(Exception e){return "";}}
-    private record RatingResult(String imdbId,String rating){}
+    private record RatingResult(String imdbId,Double rating,boolean checked,boolean rateLimited,boolean failed){}
+    private record OmdbResponse(Map<String,Object> data,boolean rateLimited,boolean failed){}
+
     private RatingResult lookupRating(String imdbId,String title,String date,String media){
-        if(!omdbKey.isBlank()&&!imdbId.isBlank())try{
-            Map<String,Object> d=omdb.get().uri("https://www.omdbapi.com/?i={id}&apikey={key}",imdbId,omdbKey).retrieve().body(Map.class);
-            if(d!=null&&"True".equalsIgnoreCase(String.valueOf(d.get("Response"))))return new RatingResult(imdbId,String.valueOf(d.getOrDefault("imdbRating","N/A")));
-        }catch(Exception ignored){}
-        if(omdbKey.isBlank()||date.length()<4)return new RatingResult(imdbId,"N/A");
+        if(omdbKey.isBlank())return new RatingResult(imdbId,null,false,false,false);
+        if(Instant.now().isBefore(omdbRateLimitedUntil))return new RatingResult(imdbId,null,false,true,false);
+        boolean attempted=false;
+        if(!imdbId.isBlank()){
+            OmdbResponse response=omdbRequest("https://www.omdbapi.com/?i={id}&apikey={key}",imdbId,omdbKey);
+            if(response.rateLimited())return new RatingResult(imdbId,null,false,true,false);
+            if(response.failed())return new RatingResult(imdbId,null,false,false,true);
+            Map<String,Object> data=response.data();
+            if(data!=null&&"True".equalsIgnoreCase(String.valueOf(data.get("Response"))))
+                return ratingFrom(data,imdbId,true);
+            attempted=true;
+        }
+        if(date.length()<4)return new RatingResult(imdbId,null,attempted,false,false);
+        String kind=media.equals("tv")?"series":"movie",year=date.substring(0,4);
+        OmdbResponse response=omdbRequest("https://www.omdbapi.com/?t={title}&y={year}&type={type}&apikey={key}",title,year,kind,omdbKey);
+        if(response.rateLimited())return new RatingResult(imdbId,null,false,true,false);
+        if(response.failed())return new RatingResult(imdbId,null,false,false,true);
+        Map<String,Object> data=response.data();
+        if(data!=null&&"True".equalsIgnoreCase(String.valueOf(data.get("Response")))
+            &&sameTitle(title,String.valueOf(data.getOrDefault("Title","")))
+            &&sameYear(year,String.valueOf(data.getOrDefault("Year",""))))
+            return ratingFrom(data,imdbId,true);
+        return new RatingResult(imdbId,null,true,false,false);
+    }
+
+    private RatingResult ratingFrom(Map<String,Object> data,String fallbackId,boolean checked){
+        String resultId=String.valueOf(data.getOrDefault("imdbID",fallbackId));
+        if(resultId.equals("null")||resultId.isBlank())resultId=fallbackId;
+        Double rating=null;
+        try{rating=Double.valueOf(String.valueOf(data.get("imdbRating")));}catch(Exception ignored){}
+        return new RatingResult(resultId,rating,checked,false,false);
+    }
+
+    private OmdbResponse omdbRequest(String uri,Object... variables){
         try{
-            String kind=media.equals("tv")?"series":"movie",year=date.substring(0,4);
-            Map<String,Object> d=omdb.get().uri("https://www.omdbapi.com/?t={title}&y={year}&type={type}&apikey={key}",title,year,kind,omdbKey).retrieve().body(Map.class);
-            if(d!=null&&"True".equalsIgnoreCase(String.valueOf(d.get("Response")))&&sameTitle(title,String.valueOf(d.getOrDefault("Title","")))&&sameYear(year,String.valueOf(d.getOrDefault("Year",""))))
-                return new RatingResult(String.valueOf(d.getOrDefault("imdbID","")),String.valueOf(d.getOrDefault("imdbRating","N/A")));
-        }catch(Exception ignored){}
-        return new RatingResult(imdbId,"N/A");
+            Map<String,Object> data=omdb.get().uri(uri,variables).retrieve().body(Map.class);
+            String error=data==null?"":String.valueOf(data.getOrDefault("Error",""));
+            String normalizedError=error.toLowerCase(Locale.ROOT);
+            if(normalizedError.contains("limit"))return new OmdbResponse(data,true,false);
+            if(normalizedError.contains("api key")||normalizedError.contains("unauthorized"))return new OmdbResponse(data,false,true);
+            return new OmdbResponse(data,false,data==null);
+        }catch(RestClientResponseException e){
+            return new OmdbResponse(null,e.getStatusCode().value()==429,true);
+        }catch(Exception e){return new OmdbResponse(null,false,true);}
+    }
+
+    private void refreshRatings(){
+        Instant start=Instant.now();int checked=0,updated=0;
+        String status="failed",message="Rating refresh failed";
+        try{
+            repository.setRatingRefreshState("running",java.sql.Timestamp.from(start),null,0,0,"Checking IMDb ratings in the background");
+            if(omdbKey.isBlank()){
+                message="OMDB_API_KEY is missing from the backend environment.";
+            }else{
+                status="complete";
+                List<Map<String,Object>> candidates=repository.ratingCandidates(region);
+                for(Map<String,Object> item:candidates){
+                    String id=String.valueOf(item.get("id")),media=String.valueOf(item.get("mediaType"));
+                    String title=String.valueOf(item.get("title"));
+                    Object yearValue=item.get("releaseYear");String date=yearValue==null?"":String.valueOf(yearValue);
+                    String imdbId=Objects.toString(item.get("imdbId"),"");
+                    if(imdbId.isBlank())imdbId=externalId(media,String.valueOf(item.get("tmdbId")));
+                    RatingResult result=lookupRating(imdbId,title,date,media);
+                    if(result.rateLimited()){
+                        omdbRateLimitedUntil=Instant.now().plus(Duration.ofHours(24));
+                        status="rate_limited";break;
+                    }
+                    if(result.failed()){
+                        status="failed";break;
+                    }
+                    if(!result.checked())continue;
+                    Double previous=(Double)item.get("imdbRating");
+                    if(result.rating()!=null&&!Objects.equals(previous,result.rating()))updated++;
+                    repository.saveImdbLookup(id,result.imdbId(),result.rating(),Instant.now());
+                    checked++;
+                    if(checked%25==0)repository.setRatingRefreshState("running",java.sql.Timestamp.from(start),null,checked,updated,
+                        "Checked "+checked+" titles; updated "+updated+" ratings");
+                }
+                if(status.equals("rate_limited"))message="OMDb daily request limit reached. "+updated+" ratings updated; remaining titles are still queued to retry.";
+                else if(status.equals("failed"))message="OMDb request failed. Check OMDB_API_KEY and try again; saved ratings were preserved.";
+                else message="Rating refresh complete. Checked "+checked+" titles and updated "+updated+" ratings.";
+            }
+            repository.setRatingRefreshState(status,java.sql.Timestamp.from(start),java.sql.Timestamp.from(Instant.now()),checked,updated,message);
+        }catch(Exception e){
+            message="Rating refresh failed: "+e.getClass().getSimpleName();
+            try{repository.setRatingRefreshState("failed",java.sql.Timestamp.from(start),java.sql.Timestamp.from(Instant.now()),checked,updated,message);}catch(Exception ignored){}
+        }
+        finally{ratingRefreshing.set(false);}
     }
     private boolean sameTitle(String a,String b){return normalize(a).equals(normalize(b));}
     private String normalize(String value){return Normalizer.normalize(value,Normalizer.Form.NFD).replaceAll("\\p{M}","").toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]","");}

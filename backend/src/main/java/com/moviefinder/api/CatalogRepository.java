@@ -53,6 +53,48 @@ public class CatalogRepository {
         return rows.isEmpty()?Map.of():rows.get(0);
     }
 
+    public List<Map<String,Object>> ratingCandidates(String region) {
+        return jdbc.query("""
+            SELECT id, tmdb_id AS "tmdbId", media_type AS "mediaType", title,
+                   release_year AS "releaseYear", imdb_id AS "imdbId", imdb_rating AS "imdbRating"
+            FROM catalog_title
+            WHERE region=?
+            ORDER BY (imdb_rating IS NULL) DESC, imdb_rating_checked_at ASC NULLS FIRST, id
+            """, (rs, row) -> {
+                Map<String,Object> item = new LinkedHashMap<>();
+                item.put("id", rs.getString("id"));
+                item.put("tmdbId", rs.getLong("tmdbId"));
+                item.put("mediaType", rs.getString("mediaType"));
+                item.put("title", rs.getString("title"));
+                int year = rs.getInt("releaseYear");
+                item.put("releaseYear", rs.wasNull() ? null : year);
+                item.put("imdbId", rs.getString("imdbId"));
+                double rating = rs.getDouble("imdbRating");
+                item.put("imdbRating", rs.wasNull() ? null : rating);
+                return item;
+            }, region);
+    }
+
+    public void saveImdbLookup(String id, String imdbId, Double rating, Instant checkedAt) {
+        jdbc.update("""
+            UPDATE catalog_title SET
+              imdb_id=COALESCE(NULLIF(?,''),imdb_id),
+              imdb_rating=COALESCE(?,imdb_rating),
+              imdb_rating_checked_at=COALESCE(?,imdb_rating_checked_at)
+            WHERE id=?
+            """, imdbId, rating, checkedAt == null ? null : java.sql.Timestamp.from(checkedAt), id);
+    }
+
+    public Map<String,Object> ratingRefreshState() {
+        return jdbc.queryForMap("SELECT status,started_at AS \"startedAt\",finished_at AS \"finishedAt\",rows_checked AS \"rowsChecked\",ratings_updated AS \"ratingsUpdated\",message FROM rating_refresh_state WHERE id=1");
+    }
+
+    public void setRatingRefreshState(String status, java.sql.Timestamp started, java.sql.Timestamp finished,
+                                     int rowsChecked, int ratingsUpdated, String message) {
+        jdbc.update("UPDATE rating_refresh_state SET status=?,started_at=COALESCE(?,started_at),finished_at=?,rows_checked=?,ratings_updated=?,message=? WHERE id=1",
+            status, started, finished, rowsChecked, ratingsUpdated, message);
+    }
+
     public void removeStalePlatformRows(String platform, java.time.Instant startedAt) {
         jdbc.update("DELETE FROM title_platform WHERE platform=? AND last_seen < ?", platform, java.sql.Timestamp.from(startedAt));
     }

@@ -38,4 +38,9 @@ public class CatalogController {
     @GetMapping("/genres") public List<String> genres(){return repository.genres(region);}
     @GetMapping("/sync-status") public Map<String,Object> syncStatus(){return repository.syncState();}
     @PostMapping("/sync") public Map<String,Object> syncNow(){boolean started=syncService.requestSyncIfStale();return Map.of("status",started?"accepted":"skipped","message",started?"Catalog sync started in the background.":"A recent sync is already running or fresh.");}
+    @PostMapping("/ratings/refresh") public Map<String,Object> refreshRatings(){
+        boolean started=syncService.requestRatingRefresh();
+        return Map.of("status",started?"accepted":"busy","message",started?"IMDb rating refresh started in the background.":"A catalog or rating refresh is already running.");
+    }
+    @GetMapping("/ratings/refresh-status") public Map<String,Object> ratingRefreshStatus(){return repository.ratingRefreshState();}
 }
