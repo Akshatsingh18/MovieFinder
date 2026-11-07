@@ -251,3 +251,4 @@ body{overflow-x:hidden;color:#f8f7f3}
 
 /* Keep the genre list inside the sidebar so it never covers later controls. */
 .genre-menu{position:relative;top:auto;left:auto;right:auto;min-width:0;margin-top:8px;max-height:320px}
+.genre-menu-footer{gap:8px;min-height:34px}.genre-menu-footer>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.genre-menu-footer button{flex:0 0 auto}
