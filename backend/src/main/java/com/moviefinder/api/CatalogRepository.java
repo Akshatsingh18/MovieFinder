@@ -106,17 +106,29 @@ public class CatalogRepository {
         jdbc.update("INSERT INTO omdb_daily_usage(usage_date,request_count) VALUES(?,1) ON CONFLICT(usage_date) DO UPDATE SET request_count=omdb_daily_usage.request_count+1,updated_at=now()",today);
     }
 
-    public void markOmdbLimitReached() {
+    public void markOmdbKeyUnavailable(String fingerprint,String status) {
+        if(!List.of("rate_limited","invalid").contains(status))throw new IllegalArgumentException("Unsupported OMDb key status");
         java.time.LocalDate today=java.time.LocalDate.now(java.time.ZoneId.of("Asia/Kolkata"));
-        jdbc.update("INSERT INTO omdb_daily_usage(usage_date,limit_reached) VALUES(?,true) ON CONFLICT(usage_date) DO UPDATE SET limit_reached=true,updated_at=now()",today);
+        jdbc.update("INSERT INTO omdb_key_daily_usage(usage_date,key_fingerprint,status) VALUES(?,?,?) ON CONFLICT(usage_date,key_fingerprint) DO UPDATE SET status=EXCLUDED.status,updated_at=now()",today,fingerprint,status);
     }
 
-    public Map<String,Object> omdbDailyUsage() {
+    public Set<String> unavailableOmdbKeyFingerprints() {
         java.time.LocalDate today=java.time.LocalDate.now(java.time.ZoneId.of("Asia/Kolkata"));
-        return jdbc.query("SELECT usage_date AS \"date\",request_count AS \"requests\",limit_reached AS \"limitReached\" FROM omdb_daily_usage WHERE usage_date=?", rs -> {
-            if(!rs.next()) return Map.of("date",today.toString(),"requests",0,"limitReached",false);
-            return Map.of("date",rs.getDate("date").toString(),"requests",rs.getInt("requests"),"limitReached",rs.getBoolean("limitReached"));
-        },today);
+        return new HashSet<>(jdbc.queryForList("SELECT key_fingerprint FROM omdb_key_daily_usage WHERE usage_date=? AND status IN ('rate_limited','invalid')",String.class,today));
+    }
+
+    public Map<String,Object> omdbDailyUsage(List<String> configuredKeyFingerprints) {
+        java.time.LocalDate today=java.time.LocalDate.now(java.time.ZoneId.of("Asia/Kolkata"));
+        int requests=jdbc.query("SELECT request_count FROM omdb_daily_usage WHERE usage_date=?",rs->rs.next()?rs.getInt(1):0,today);
+        Map<String,String> statuses=new HashMap<>();
+        if(!configuredKeyFingerprints.isEmpty())jdbc.query("SELECT key_fingerprint,status FROM omdb_key_daily_usage WHERE usage_date=?",rs->{while(rs.next())statuses.put(rs.getString(1),rs.getString(2));return null;},today);
+        long limited=configuredKeyFingerprints.stream().filter(fp->"rate_limited".equals(statuses.get(fp))).count();
+        long invalid=configuredKeyFingerprints.stream().filter(fp->"invalid".equals(statuses.get(fp))).count();
+        int remaining=(int)configuredKeyFingerprints.stream().filter(fp->!statuses.containsKey(fp)).count();
+        boolean allRateLimited=!configuredKeyFingerprints.isEmpty()&&limited==configuredKeyFingerprints.size();
+        jdbc.update("UPDATE omdb_daily_usage SET limit_reached=?,updated_at=now() WHERE usage_date=?",allRateLimited,today);
+        Map<String,Object> usage=new LinkedHashMap<>();usage.put("date",today.toString());usage.put("requests",requests);usage.put("limitReached",allRateLimited);
+        usage.put("keysConfigured",configuredKeyFingerprints.size());usage.put("keysRemaining",remaining);usage.put("keysRateLimited",limited);usage.put("keysInvalid",invalid);return usage;
     }
 
     public Map<String,Object> ratingRefreshState() {

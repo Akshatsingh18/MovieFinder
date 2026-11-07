@@ -4,6 +4,9 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.Duration;
 import java.text.Normalizer;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -23,22 +26,24 @@ public class CatalogSyncService {
     private final CatalogRepository repository;
     private final Executor syncExecutor;
     private final RestClient tmdb,omdb=RestClient.create();
-    private final String tmdbKey,omdbKey,region;
+    private final String tmdbKey,region;
+    private final List<String> omdbKeys,omdbKeyFingerprints;
     private final boolean v3;
     private final int syncPages;
     private final long syncOpenCooldownMs;
     private final AtomicBoolean running=new AtomicBoolean(false),ratingRefreshing=new AtomicBoolean(false);
     private final Object jobLock=new Object();
-    private volatile Instant omdbRateLimitedUntil=Instant.MIN;
+    private volatile String omdbKeyError="";
     private volatile String message="Waiting for first background sync";
     private final Map<String,Map<Integer,String>> genres=new ConcurrentHashMap<>();
 
     public CatalogSyncService(CatalogRepository repository, @Qualifier("catalogSyncExecutor") Executor syncExecutor,
-      @Value("${TMDB_API_KEY:}") String tmdbKey,@Value("${OMDB_API_KEY:}") String omdbKey,
+      @Value("${TMDB_API_KEY:}") String tmdbKey,@Value("${OMDB_API_KEYS:}") String omdbKeys,
+      @Value("${OMDB_API_KEY:}") String legacyOmdbKey,
       @Value("${app.region:IN}") String region,@Value("${app.sync-pages:5}") int syncPages,
       @Value("${app.sync-open-cooldown-ms:21600000}") long syncOpenCooldownMs){
         if(tmdbKey.isBlank())throw new IllegalStateException("Set TMDB_API_KEY before starting the backend.");
-        this.repository=repository;this.syncExecutor=syncExecutor;this.tmdbKey=tmdbKey;this.omdbKey=omdbKey;this.region=region;this.syncPages=Math.max(1,Math.min(syncPages,50));
+        this.repository=repository;this.syncExecutor=syncExecutor;this.tmdbKey=tmdbKey;this.omdbKeys=parseOmdbKeys(omdbKeys,legacyOmdbKey);this.omdbKeyFingerprints=this.omdbKeys.stream().map(CatalogSyncService::fingerprint).toList();this.region=region;this.syncPages=Math.max(1,Math.min(syncPages,50));
         this.syncOpenCooldownMs=syncOpenCooldownMs;
         this.v3=tmdbKey.matches("(?i)[0-9a-f]{32}");
         RestClient.Builder b=RestClient.builder().baseUrl(TMDB);if(!v3)b.defaultHeader("Authorization","Bearer "+tmdbKey);this.tmdb=b.build();
@@ -113,6 +118,7 @@ public class CatalogSyncService {
     public boolean isSyncing(){return running.get();}
     public boolean isRatingRefreshing(){return ratingRefreshing.get();}
     public String message(){return message;}
+    public Map<String,Object> omdbDailyUsage(){return repository.omdbDailyUsage(omdbKeyFingerprints);}
 
     public Map<String,Object> titleWatchLink(String catalogId){
         int separator=catalogId.lastIndexOf('-');
@@ -162,15 +168,15 @@ public class CatalogSyncService {
     private Map<Integer,String> loadGenres(String media){Map<String,Object> data=tmdb.get().uri(path("/genre/{media}/list?language=en"),vars(media)).retrieve().body(Map.class);Map<Integer,String> r=new HashMap<>();if(data!=null)for(Map<String,Object> g:(List<Map<String,Object>>)data.getOrDefault("genres",List.of()))r.put(((Number)g.get("id")).intValue(),String.valueOf(g.get("name")));return r;}
     private String externalId(String media,String id){try{Map<String,Object> d=tmdb.get().uri(path("/{media}/{id}/external_ids"),vars(media,id)).retrieve().body(Map.class);Object ext=d==null?null:d.get("imdb_id");return ext==null?"":String.valueOf(ext);}catch(Exception e){return "";}}
     private record RatingResult(String imdbId,Double rating,Long votes,boolean checked,boolean rateLimited,boolean failed){}
-    private record OmdbResponse(Map<String,Object> data,boolean rateLimited,boolean failed){}
+    private record OmdbResponse(Map<String,Object> data,boolean rateLimited,boolean invalidKey,boolean failed){}
 
     private RatingResult lookupRating(String imdbId,String title,String date,String media){
-        if(omdbKey.isBlank())return new RatingResult(imdbId,null,null,false,false,false);
-        if(Instant.now().isBefore(omdbRateLimitedUntil)||Boolean.TRUE.equals(repository.omdbDailyUsage().get("limitReached")))return new RatingResult(imdbId,null,null,false,true,false);
+        if(omdbKeys.isEmpty())return new RatingResult(imdbId,null,null,false,false,true);
+        if(Boolean.TRUE.equals(omdbDailyUsage().get("limitReached")))return new RatingResult(imdbId,null,null,false,true,false);
         boolean attempted=false;
         if(!imdbId.isBlank()){
-            OmdbResponse response=omdbRequest("https://www.omdbapi.com/?i={id}&apikey={key}",imdbId,omdbKey);
-            if(response.rateLimited()){repository.markOmdbLimitReached();return new RatingResult(imdbId,null,null,false,true,false);}
+            OmdbResponse response=omdbRequest("https://www.omdbapi.com/?i={id}&apikey={key}",imdbId);
+            if(response.rateLimited())return new RatingResult(imdbId,null,null,false,true,false);
             if(response.failed())return new RatingResult(imdbId,null,null,false,false,true);
             Map<String,Object> data=response.data();
             if(data!=null&&"True".equalsIgnoreCase(String.valueOf(data.get("Response"))))
@@ -179,8 +185,8 @@ public class CatalogSyncService {
         }
         if(date.length()<4)return new RatingResult(imdbId,null,null,attempted,false,false);
         String kind=media.equals("tv")?"series":"movie",year=date.substring(0,4);
-        OmdbResponse response=omdbRequest("https://www.omdbapi.com/?t={title}&y={year}&type={type}&apikey={key}",title,year,kind,omdbKey);
-        if(response.rateLimited()){repository.markOmdbLimitReached();return new RatingResult(imdbId,null,null,false,true,false);}
+        OmdbResponse response=omdbRequest("https://www.omdbapi.com/?t={title}&y={year}&type={type}&apikey={key}",title,year,kind);
+        if(response.rateLimited())return new RatingResult(imdbId,null,null,false,true,false);
         if(response.failed())return new RatingResult(imdbId,null,null,false,false,true);
         Map<String,Object> data=response.data();
         if(data!=null&&"True".equalsIgnoreCase(String.valueOf(data.get("Response")))
@@ -201,20 +207,47 @@ public class CatalogSyncService {
     }
 
     private OmdbResponse omdbRequest(String uri,Object... variables){
+        Set<String> unavailable=repository.unavailableOmdbKeyFingerprints();
+        for(int index=0;index<omdbKeys.size();index++){
+            String key=omdbKeys.get(index),fingerprint=omdbKeyFingerprints.get(index);
+            if(unavailable.contains(fingerprint))continue;
+            OmdbResponse response=omdbRequestWithKey(uri,variables,key);
+            if(response.rateLimited()){
+                repository.markOmdbKeyUnavailable(fingerprint,"rate_limited");
+                unavailable.add(fingerprint);
+                if(index+1<omdbKeys.size())message="OMDb key "+(index+1)+" reached its daily limit; switching to the next key.";
+                continue;
+            }
+            if(response.invalidKey()){
+                repository.markOmdbKeyUnavailable(fingerprint,"invalid");
+                unavailable.add(fingerprint);
+                if(index+1<omdbKeys.size())message="OMDb key "+(index+1)+" is invalid; switching to the next key.";
+                continue;
+            }
+            return response;
+        }
+        Map<String,Object> usage=omdbDailyUsage();
+        if(Boolean.TRUE.equals(usage.get("limitReached")))return new OmdbResponse(null,true,false,false);
+        omdbKeyError="No usable OMDb keys remain. Check the OMDB_API_KEYS values in the backend environment.";
+        return new OmdbResponse(null,false,false,true);
+    }
+
+    private OmdbResponse omdbRequestWithKey(String uri,Object[] variables,String key){
         repository.recordOmdbRequest();
+        Object[] requestVariables=Arrays.copyOf(variables,variables.length+1);requestVariables[variables.length]=key;
         try{
-            Map<String,Object> data=omdb.get().uri(uri,variables).retrieve().body(Map.class);
+            Map<String,Object> data=omdb.get().uri(uri,requestVariables).retrieve().body(Map.class);
             String error=data==null?"":String.valueOf(data.getOrDefault("Error",""));
             String normalizedError=error.toLowerCase(Locale.ROOT);
-            if(normalizedError.contains("limit")){repository.markOmdbLimitReached();return new OmdbResponse(data,true,false);}
-            if(normalizedError.contains("api key")||normalizedError.contains("unauthorized"))return new OmdbResponse(data,false,true);
-            return new OmdbResponse(data,false,data==null);
+            if(normalizedError.contains("limit"))return new OmdbResponse(data,true,false,false);
+            if(normalizedError.contains("api key")||normalizedError.contains("unauthorized"))return new OmdbResponse(data,false,true,false);
+            return new OmdbResponse(data,false,false,data==null);
         }catch(RestClientResponseException e){
             String responseText=Objects.toString(e.getResponseBodyAsString(),"").toLowerCase(Locale.ROOT);
             boolean rateLimited=e.getStatusCode().value()==429||responseText.contains("limit");
-            if(rateLimited)repository.markOmdbLimitReached();
-            return new OmdbResponse(null,rateLimited,true);
-        }catch(Exception e){return new OmdbResponse(null,false,true);}
+            boolean invalidKey=e.getStatusCode().value()==401||responseText.contains("api key")||responseText.contains("unauthorized");
+            return new OmdbResponse(null,rateLimited,invalidKey,!rateLimited&&!invalidKey);
+        }catch(Exception e){return new OmdbResponse(null,false,false,true);}
     }
 
     private void refreshRatings(){
@@ -222,8 +255,9 @@ public class CatalogSyncService {
         String status="failed",message="Rating refresh failed";
         try{
             repository.setRatingRefreshState("running",java.sql.Timestamp.from(start),null,0,0,"Checking IMDb ratings in the background");
-            if(omdbKey.isBlank()){
-                message="OMDB_API_KEY is missing from the backend environment.";
+            omdbKeyError="";
+            if(omdbKeys.isEmpty()){
+                message="OMDB_API_KEYS (or OMDB_API_KEY) is missing from the backend environment.";
             }else{
                 status="complete";
                 List<Map<String,Object>> candidates=repository.ratingCandidates(region);
@@ -235,7 +269,6 @@ public class CatalogSyncService {
                     if(imdbId.isBlank())imdbId=externalId(media,String.valueOf(item.get("tmdbId")));
                     RatingResult result=lookupRating(imdbId,title,date,media);
                     if(result.rateLimited()){
-                        omdbRateLimitedUntil=Instant.now().plus(Duration.ofHours(24));
                         status="rate_limited";break;
                     }
                     if(result.failed()){
@@ -249,8 +282,8 @@ public class CatalogSyncService {
                     if(checked%25==0)repository.setRatingRefreshState("running",java.sql.Timestamp.from(start),null,checked,updated,
                         "Checked "+checked+" titles; updated "+updated+" ratings");
                 }
-                if(status.equals("rate_limited"))message="OMDb daily request limit reached. Saved "+updated+" ratings; remaining titles will retry tomorrow.";
-                else if(status.equals("failed"))message="OMDb request failed. Check OMDB_API_KEY and try again; saved ratings were preserved.";
+                if(status.equals("rate_limited"))message="All configured OMDb keys reached their daily limits. Saved "+updated+" ratings; remaining titles will retry tomorrow.";
+                else if(status.equals("failed"))message=omdbKeyError.isBlank()?"OMDb request failed. Check OMDB_API_KEYS and try again; saved ratings were preserved.":omdbKeyError;
                 else message="Rating refresh complete. Checked "+checked+" titles and updated "+updated+" ratings.";
             }
             repository.setRatingRefreshState(status,java.sql.Timestamp.from(start),java.sql.Timestamp.from(Instant.now()),checked,updated,message);
@@ -263,6 +296,16 @@ public class CatalogSyncService {
     private boolean sameTitle(String a,String b){return normalize(a).equals(normalize(b));}
     private String normalize(String value){return Normalizer.normalize(value,Normalizer.Form.NFD).replaceAll("\\p{M}","").toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]","");}
     private boolean sameYear(String a,String b){return b.length()>=4&&a.equals(b.substring(0,4));}
+    private static List<String> parseOmdbKeys(String configured,String fallback){
+        List<String> keys=Arrays.stream(Objects.toString(configured,"").split("[,;\\s]+"))
+            .map(String::trim).filter(key->!key.isBlank()).distinct().toList();
+        if(!keys.isEmpty())return keys;
+        String single=Objects.toString(fallback,"").trim();return single.isBlank()?List.of():List.of(single);
+    }
+    private static String fingerprint(String key){
+        try{return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(key.getBytes(StandardCharsets.UTF_8)));}
+        catch(NoSuchAlgorithmException e){throw new IllegalStateException("SHA-256 is not available",e);}
+    }
     private String path(String p){return v3?p+(p.contains("?")?"&":"?")+"api_key={apiKey}":p;}
     private Object[] vars(Object... values){if(!v3)return values;Object[] a=Arrays.copyOf(values,values.length+1);a[values.length]=tmdbKey;return a;}
 }

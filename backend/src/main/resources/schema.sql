@@ -73,3 +73,10 @@ CREATE TABLE IF NOT EXISTS omdb_daily_usage (
   limit_reached BOOLEAN NOT NULL DEFAULT FALSE,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS omdb_key_daily_usage (
+  usage_date DATE NOT NULL,
+  key_fingerprint CHAR(64) NOT NULL,
+  status VARCHAR(20) NOT NULL CHECK (status IN ('rate_limited','invalid')),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (usage_date, key_fingerprint)
+);
